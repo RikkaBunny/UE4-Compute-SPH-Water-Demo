@@ -1,0 +1,13 @@
+* text=auto
+*.h text eol=lf
+*.cpp text eol=lf
+*.cs text eol=lf
+*.usf text eol=lf
+*.ush text eol=lf
+*.ini text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.uasset binary
+*.umap binary
+*.png binary
+

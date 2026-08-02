@@ -1,0 +1,1015 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/GammaCorrectionCommon.ush"
+
+uint UseWhiteParticles;
+uint MaxParticleCount;
+float ParticleRadiusCm;
+float FoamRadiusCm;
+uint OccludeThicknessWithFoam;
+float4x4 LocalToWorld;
+
+StructuredBuffer<float4> FluidPositions;
+struct FSPHWhiteParticle
+{
+	float4 PositionLifetime;
+	float4 VelocityScale;
+};
+StructuredBuffer<FSPHWhiteParticle> WhiteParticles;
+StructuredBuffer<uint> WhiteParticleCounters;
+StructuredBuffer<uint> FoamOcclusionDepth;
+RWStructuredBuffer<uint> ScreenDepthOutput;
+RWStructuredBuffer<uint> ScreenAccumulationOutput;
+RWStructuredBuffer<uint> ShadowAccumulationOutput;
+StructuredBuffer<uint> ShadowInputBuffer;
+RWStructuredBuffer<uint> ShadowOutputBuffer;
+StructuredBuffer<uint> ShadowBuffer;
+int2 ShadowSize;
+int2 ShadowFilterDirection;
+uint ShadowInputIsFixedPoint;
+
+StructuredBuffer<uint> DecodeInputDepth;
+StructuredBuffer<uint> DecodeInputThickness;
+RWStructuredBuffer<uint> DecodeOutputDepth;
+RWStructuredBuffer<uint> DecodeOutputThickness;
+StructuredBuffer<uint> RawDepthBuffer;
+StructuredBuffer<uint> InputDepthBuffer;
+StructuredBuffer<uint> InputThicknessBuffer;
+RWStructuredBuffer<uint> OutputDepthBuffer;
+RWStructuredBuffer<uint> OutputThicknessBuffer;
+int2 ViewSize;
+int2 FilterDirection;
+float ProjectionScaleX;
+float WorldFilterRadiusCm;
+uint MaxFilterRadius;
+float FilterStrength;
+float DepthDifferenceStrength;
+
+StructuredBuffer<uint> FluidDepthBuffer;
+StructuredBuffer<uint> SmoothedThicknessBuffer;
+StructuredBuffer<uint> FoamDepthBuffer;
+StructuredBuffer<uint> FoamMaskBuffer;
+float3 ExtinctionCoefficients;
+float ExtinctionMultiplier;
+float RefractionMultiplier;
+float3 BoundsSizeCm;
+float3 DirToSunWorld;
+float3 CameraRightWorld;
+float3 CameraUpWorld;
+float3 CameraForwardWorld;
+float2 CameraTanHalfFov;
+float3 CameraPositionWorld;
+float3 SimulationOriginWorld;
+float SourceShadowHalfWidthCm;
+float SourceShadowHalfHeightCm;
+uint FoamMax;
+
+[numthreads(256, 1, 1)]
+void ScreenSplatCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint ParticleIndex = DispatchThreadID.x;
+
+	uint ActiveCount = UseWhiteParticles != 0
+		? min(MaxParticleCount, WhiteParticleCounters[0])
+		: MaxParticleCount;
+	if (ParticleIndex >= ActiveCount)
+	{
+		return;
+	}
+	float3 LocalPositionMetres;
+	float RadiusCm = ParticleRadiusCm;
+	if (UseWhiteParticles != 0)
+	{
+		FSPHWhiteParticle WhiteParticle = WhiteParticles[ParticleIndex];
+		LocalPositionMetres = WhiteParticle.PositionLifetime.xyz;
+		float DissolveScale =
+			saturate(WhiteParticle.PositionLifetime.w / 3.0);
+		float SpeedScale = lerp(
+			0.6,
+			1.0,
+			saturate(
+				(length(WhiteParticle.VelocityScale.xyz) - 1.0)
+				/ 2.0));
+		RadiusCm =
+			FoamRadiusCm
+			* DissolveScale
+			* WhiteParticle.VelocityScale.w
+			* SpeedScale;
+	}
+	else
+	{
+		LocalPositionMetres = FluidPositions[ParticleIndex].xyz;
+	}
+
+	float3 LocalPositionCm = LocalPositionMetres * 100.0;
+	float3 WorldPosition =
+		mul(float4(LocalPositionCm, 1.0), LocalToWorld).xyz;
+	float3 TranslatedWorldPosition =
+		WorldPosition + View.PreViewTranslation.xyz;
+	float4 CentreClip = mul(
+		float4(TranslatedWorldPosition, 1.0),
+		View.TranslatedWorldToClip);
+	if (CentreClip.w <= 0.0)
+	{
+		return;
+	}
+
+	float2 CentreNDC = CentreClip.xy / CentreClip.w;
+	float2 CentrePixel =
+		(CentreNDC * float2(0.5, -0.5) + 0.5)
+		* float2(ViewSize);
+	float3 CentreView = mul(
+		float4(TranslatedWorldPosition, 1.0),
+		View.TranslatedWorldToView).xyz;
+	float4 RadiusClip = mul(
+		float4(CentreView + float3(RadiusCm, 0.0, 0.0), 1.0),
+		View.ViewToClip);
+	float RadiusPixels = abs(
+		(RadiusClip.x / max(RadiusClip.w, 0.0001) - CentreNDC.x)
+		* 0.5
+		* ViewSize.x);
+	if (RadiusPixels <= 0.00001)
+	{
+		return;
+	}
+	int2 MinimumPixel = max(
+		int2(0, 0),
+		(int2)floor(CentrePixel - RadiusPixels));
+	int2 MaximumPixel = min(
+		ViewSize - 1,
+		(int2)ceil(CentrePixel + RadiusPixels));
+	float RadialDepth =
+		length(WorldPosition - View.WorldCameraOrigin.xyz);
+	float ViewDepth = abs(CentreView.z);
+
+	for (int PixelY = MinimumPixel.y;
+		PixelY <= MaximumPixel.y;
+		++PixelY)
+	{
+		for (int PixelX = MinimumPixel.x;
+			PixelX <= MaximumPixel.x;
+			++PixelX)
+		{
+			int2 Pixel = int2(PixelX, PixelY);
+			float2 SphereCoordinate =
+				(float2(Pixel) + 0.5 - CentrePixel)
+				/ RadiusPixels;
+			float RadiusSquared =
+				dot(SphereCoordinate, SphereCoordinate);
+			if (RadiusSquared >= 1.0)
+			{
+				continue;
+			}
+
+			float SphereZ = sqrt(max(0.0, 1.0 - RadiusSquared));
+			float LinearDepth =
+				UseWhiteParticles != 0
+					? ViewDepth
+					: max(0.0, RadialDepth - SphereZ * RadiusCm);
+			uint PixelIndex =
+				(uint)Pixel.y * (uint)ViewSize.x + (uint)Pixel.x;
+			InterlockedMin(
+				ScreenDepthOutput[PixelIndex],
+				asuint(LinearDepth));
+			if (UseWhiteParticles != 0)
+			{
+				InterlockedMax(
+					ScreenAccumulationOutput[PixelIndex],
+					2000u);
+			}
+			else if (RadiusSquared < 0.49)
+			{
+				// The source copies foam depth into the thickness target and
+				// draws thickness with ZTest LEqual.
+				bool PassesFoamDepth =
+					OccludeThicknessWithFoam == 0u
+					|| ViewDepth
+						<= asfloat(FoamOcclusionDepth[PixelIndex]);
+				if (PassesFoamDepth)
+				{
+					InterlockedAdd(
+						ScreenAccumulationOutput[PixelIndex],
+						100u);
+				}
+			}
+		}
+	}
+}
+
+static const float3 SourceShadowRight =
+	float3(-0.12961042, -0.47626843, -0.86969507);
+static const float3 SourceShadowUp =
+	float3(0.71920730, 0.55864170, -0.41311050);
+
+[numthreads(256, 1, 1)]
+void ShadowSplatCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint ParticleIndex = DispatchThreadID.x;
+	if (ParticleIndex >= MaxParticleCount)
+	{
+		return;
+	}
+
+	float3 SourcePositionCm =
+		FluidPositions[ParticleIndex].xyz * 100.0
+		- float3(0.0, 0.0, 500.0);
+	float2 ShadowUV = float2(
+		dot(SourcePositionCm, SourceShadowRight)
+			/ (2.0 * SourceShadowHalfWidthCm)
+			+ 0.5,
+		dot(SourcePositionCm, SourceShadowUp)
+			/ (2.0 * SourceShadowHalfHeightCm)
+			+ 0.5);
+	float2 CentrePixel =
+		ShadowUV * float2(ShadowSize);
+	float RadiusPixels =
+		7.0
+		* ShadowSize.y
+		/ (2.0 * SourceShadowHalfHeightCm);
+	if (RadiusPixels <= 0.00001)
+	{
+		return;
+	}
+	int2 MinimumPixel = max(
+		int2(0, 0),
+		(int2)floor(CentrePixel - RadiusPixels));
+	int2 MaximumPixel = min(
+		ShadowSize - 1,
+		(int2)ceil(CentrePixel + RadiusPixels));
+
+	for (int PixelY = MinimumPixel.y;
+		PixelY <= MaximumPixel.y;
+		++PixelY)
+	{
+		for (int PixelX = MinimumPixel.x;
+			PixelX <= MaximumPixel.x;
+			++PixelX)
+		{
+			int2 Pixel = int2(PixelX, PixelY);
+			float2 CirclePosition =
+				((float2(Pixel) + 0.5) - CentrePixel)
+				/ RadiusPixels;
+			if (dot(CirclePosition, CirclePosition) >= 1.0)
+			{
+				continue;
+			}
+			uint PixelIndex =
+				(uint)Pixel.y * (uint)ShadowSize.x
+				+ (uint)Pixel.x;
+			InterlockedAdd(
+				ShadowAccumulationOutput[PixelIndex],
+				100u);
+		}
+	}
+}
+
+[numthreads(8, 8, 1)]
+void ShadowSmoothCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	int2 Pixel = int2(DispatchThreadID.xy);
+	if (any(Pixel >= ShadowSize))
+	{
+		return;
+	}
+
+	const int Radius = 8;
+	const float Sigma = 8.0 / (6.0 * 0.529);
+	float Sum = 0.0;
+	float WeightSum = 0.0;
+	for (int Offset = -Radius; Offset <= Radius; ++Offset)
+	{
+		int2 SamplePixel =
+			clamp(
+				Pixel + ShadowFilterDirection * Offset,
+				int2(0, 0),
+				ShadowSize - 1);
+		uint SampleIndex =
+			(uint)SamplePixel.y * (uint)ShadowSize.x
+			+ (uint)SamplePixel.x;
+		float Sample =
+			ShadowInputIsFixedPoint != 0
+				? ShadowInputBuffer[SampleIndex] / 1000.0
+				: asfloat(ShadowInputBuffer[SampleIndex]);
+		float Weight =
+			exp(
+				-(Offset * Offset)
+				/ (2.0 * Sigma * Sigma));
+		Sum += Sample * Weight;
+		WeightSum += Weight;
+	}
+	uint PixelIndex =
+		(uint)Pixel.y * (uint)ShadowSize.x + (uint)Pixel.x;
+	ShadowOutputBuffer[PixelIndex] =
+		asuint(Sum / max(WeightSum, 0.000001));
+}
+
+[numthreads(8, 8, 1)]
+void DecodeSmoothDepthCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	int2 Pixel = int2(DispatchThreadID.xy);
+	if (any(Pixel >= ViewSize))
+	{
+		return;
+	}
+
+	uint PixelIndex =
+		(uint)Pixel.y * (uint)ViewSize.x + (uint)Pixel.x;
+	float CentreHardDepth =
+		asfloat(DecodeInputDepth[PixelIndex]);
+	if (CentreHardDepth >= 65000.0)
+	{
+		DecodeOutputDepth[PixelIndex] = asuint(CentreHardDepth);
+		DecodeOutputThickness[PixelIndex] = asuint(0.0);
+		return;
+	}
+
+	float RadiusFloat = abs(
+		(ViewSize.x * ProjectionScaleX)
+		/ (2.0 * max(CentreHardDepth, 0.0001))
+		* WorldFilterRadiusCm);
+	int Radius = (int)ceil(RadiusFloat);
+	if (Radius <= 1 && WorldFilterRadiusCm > 0.0)
+	{
+		Radius = 2;
+	}
+	Radius = min((int)MaxFilterRadius, Radius);
+	float FractionalRadius = max(0.0, Radius - RadiusFloat);
+	float Sigma = max(
+		0.0000001,
+		(Radius - FractionalRadius)
+		/ (6.0 * max(0.001, FilterStrength)));
+
+	float WeightedDepth = 0.0;
+	float WeightedThickness = 0.0;
+	float WeightSum = 0.0;
+	[loop]
+	for (int Offset = -Radius; Offset <= Radius; ++Offset)
+	{
+		int2 SamplePixel =
+			clamp(Pixel + FilterDirection * Offset, int2(0, 0), ViewSize - 1);
+		uint SampleIndex =
+			(uint)SamplePixel.y * (uint)ViewSize.x
+			+ (uint)SamplePixel.x;
+		float SampleDepth =
+			asfloat(DecodeInputDepth[SampleIndex]);
+		float SampleThickness =
+			DecodeInputThickness[SampleIndex] / 1000.0;
+		float SpatialWeight =
+			exp(-(Offset * Offset) / (2.0 * Sigma * Sigma));
+		float DifferenceMetres =
+			(CentreHardDepth - SampleDepth) * 0.01;
+		float RangeWeight =
+			exp(
+				-DifferenceMetres
+				* DifferenceMetres
+				* DepthDifferenceStrength);
+		float Weight = SpatialWeight * RangeWeight;
+		WeightedDepth += SampleDepth * Weight;
+		WeightedThickness += SampleThickness * Weight;
+		WeightSum += Weight;
+	}
+	float InverseWeight = WeightSum > 0.0 ? rcp(WeightSum) : 0.0;
+	DecodeOutputDepth[PixelIndex] =
+		asuint(
+			WeightSum > 0.0
+				? WeightedDepth * InverseWeight
+				: CentreHardDepth);
+	DecodeOutputThickness[PixelIndex] =
+		asuint(
+			WeightSum > 0.0
+				? WeightedThickness * InverseWeight
+				: DecodeInputThickness[PixelIndex] / 1000.0);
+}
+
+[numthreads(8, 8, 1)]
+void SmoothDepthCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	int2 Pixel = int2(DispatchThreadID.xy);
+	if (any(Pixel >= ViewSize))
+	{
+		return;
+	}
+
+	uint PixelIndex =
+		(uint)Pixel.y * (uint)ViewSize.x + (uint)Pixel.x;
+	float CentreHardDepth = asfloat(RawDepthBuffer[PixelIndex]);
+	float CentreDepth = asfloat(InputDepthBuffer[PixelIndex]);
+	float CentreThickness =
+		asfloat(InputThicknessBuffer[PixelIndex]);
+	if (CentreHardDepth >= 65000.0)
+	{
+		OutputDepthBuffer[PixelIndex] = asuint(CentreDepth);
+		OutputThicknessBuffer[PixelIndex] =
+			asuint(CentreThickness);
+		return;
+	}
+
+	float RadiusFloat = abs(
+		(ViewSize.x * ProjectionScaleX)
+		/ (2.0 * max(CentreHardDepth, 0.0001))
+		* WorldFilterRadiusCm);
+	int Radius = (int)ceil(RadiusFloat);
+	if (Radius <= 1 && WorldFilterRadiusCm > 0.0)
+	{
+		Radius = 2;
+	}
+	Radius = min((int)MaxFilterRadius, Radius);
+	float FractionalRadius = max(0.0, Radius - RadiusFloat);
+	float Sigma = max(
+		0.0000001,
+		(Radius - FractionalRadius)
+		/ (6.0 * max(0.001, FilterStrength)));
+
+	float WeightedDepth = 0.0;
+	float WeightedThickness = 0.0;
+	float WeightSum = 0.0;
+	[loop]
+	for (int Offset = -Radius; Offset <= Radius; ++Offset)
+	{
+		int2 SamplePixel =
+			clamp(Pixel + FilterDirection * Offset, int2(0, 0), ViewSize - 1);
+		uint SampleIndex =
+			(uint)SamplePixel.y * (uint)ViewSize.x
+			+ (uint)SamplePixel.x;
+		float SampleDepth =
+			asfloat(InputDepthBuffer[SampleIndex]);
+		float SampleThickness =
+			asfloat(InputThicknessBuffer[SampleIndex]);
+		float SampleHardDepth =
+			asfloat(RawDepthBuffer[SampleIndex]);
+		float SpatialWeight =
+			exp(-(Offset * Offset) / (2.0 * Sigma * Sigma));
+		float DifferenceMetres =
+			(CentreHardDepth - SampleHardDepth) * 0.01;
+		float RangeWeight =
+			exp(
+				-DifferenceMetres
+				* DifferenceMetres
+				* DepthDifferenceStrength);
+		float Weight = SpatialWeight * RangeWeight;
+		WeightedDepth += SampleDepth * Weight;
+		WeightedThickness += SampleThickness * Weight;
+		WeightSum += Weight;
+	}
+	float InverseWeight = WeightSum > 0.0 ? rcp(WeightSum) : 0.0;
+	OutputDepthBuffer[PixelIndex] =
+		asuint(
+			WeightSum > 0.0
+				? WeightedDepth * InverseWeight
+				: CentreDepth);
+	OutputThicknessBuffer[PixelIndex] =
+		asuint(
+			WeightSum > 0.0
+				? WeightedThickness * InverseWeight
+				: CentreThickness);
+}
+
+struct FScreenCompositeVSToPS
+{
+	float4 Position : SV_Position;
+	noperspective float4 UVAndScreenPos : TEXCOORD0;
+};
+
+float LoadFluidDepth(int2 Pixel)
+{
+	Pixel = clamp(Pixel, int2(0, 0), ViewSize - 1);
+	return asfloat(
+		FluidDepthBuffer[
+			(uint)Pixel.y * (uint)ViewSize.x + (uint)Pixel.x]);
+}
+
+float2 PixelUV(int2 Pixel)
+{
+	return (float2(Pixel) + 0.5) / float2(ViewSize);
+}
+
+float3 WorldViewDirection(float2 UV)
+{
+	float2 NDC =
+		(UV * 2.0 - 1.0)
+		* float2(1.0, -1.0);
+	return normalize(
+		CameraForwardWorld
+		+ CameraRightWorld
+			* NDC.x
+			* CameraTanHalfFov.x
+		+ CameraUpWorld
+			* NDC.y
+			* CameraTanHalfFov.y);
+}
+
+float3 FluidRelativeWorldPosition(int2 Pixel, float Depth)
+{
+	return WorldViewDirection(PixelUV(Pixel)) * Depth;
+}
+
+float3 FluidNormalFromDepth(
+	int2 Pixel,
+	float CentreDepth,
+	float3 CentreViewDirection)
+{
+	float3 CentrePosition =
+		CentreViewDirection * CentreDepth;
+
+	int2 RightPixel =
+		clamp(Pixel + int2(1, 0), int2(0, 0), ViewSize - 1);
+	int2 LeftPixel =
+		clamp(Pixel - int2(1, 0), int2(0, 0), ViewSize - 1);
+	int2 DownPixel =
+		clamp(Pixel + int2(0, 1), int2(0, 0), ViewSize - 1);
+	int2 UpPixel =
+		clamp(Pixel - int2(0, 1), int2(0, 0), ViewSize - 1);
+
+	float RightDepth = LoadFluidDepth(RightPixel);
+	float LeftDepth = LoadFluidDepth(LeftPixel);
+	float DownDepth = LoadFluidDepth(DownPixel);
+	float UpDepth = LoadFluidDepth(UpPixel);
+	RightDepth = RightDepth >= 65000.0 ? CentreDepth : RightDepth;
+	LeftDepth = LeftDepth >= 65000.0 ? CentreDepth : LeftDepth;
+	DownDepth = DownDepth >= 65000.0 ? CentreDepth : DownDepth;
+	UpDepth = UpDepth >= 65000.0 ? CentreDepth : UpDepth;
+
+	float3 Ddx =
+		FluidRelativeWorldPosition(RightPixel, RightDepth)
+		- CentrePosition;
+	float3 DdxBack =
+		CentrePosition
+		- FluidRelativeWorldPosition(LeftPixel, LeftDepth);
+	if (abs(dot(DdxBack, CameraForwardWorld))
+		< abs(dot(Ddx, CameraForwardWorld)))
+	{
+		Ddx = DdxBack;
+	}
+
+	float3 Ddy =
+		FluidRelativeWorldPosition(DownPixel, DownDepth)
+		- CentrePosition;
+	float3 DdyBack =
+		CentrePosition
+		- FluidRelativeWorldPosition(UpPixel, UpDepth);
+	if (abs(dot(DdyBack, CameraForwardWorld))
+		< abs(dot(Ddy, CameraForwardWorld)))
+	{
+		Ddy = DdyBack;
+	}
+
+	float3 WorldNormal = normalize(cross(Ddy, Ddx));
+	if (dot(WorldNormal, -CentreViewDirection) < 0.0)
+	{
+		WorldNormal = -WorldNormal;
+	}
+	return WorldNormal;
+}
+
+float3 ClosestBoxFaceNormal(float3 BoxSize, float3 Position)
+{
+	float3 HalfSize = BoxSize * 0.5;
+	float3 Offset = HalfSize - abs(Position);
+	return Offset.x < Offset.y && Offset.x < Offset.z
+		? float3(sign(Position.x), 0.0, 0.0)
+		: Offset.y < Offset.z
+			? float3(0.0, sign(Position.y), 0.0)
+			: float3(0.0, 0.0, sign(Position.z));
+}
+
+float3 SmoothBoundsEdgeNormal(
+	float3 WorldNormal,
+	float3 WorldPosition)
+{
+	float3 LocalPosition =
+		WorldPosition - SimulationOriginWorld
+		- float3(0.0, 0.0, 500.0);
+	float3 LocalNormal = WorldNormal;
+	float3 Offset = BoundsSizeCm * 0.5 - abs(LocalPosition);
+	float FaceWeight = max(0.0, min(Offset.x, Offset.y));
+	float3 FaceNormal =
+		ClosestBoxFaceNormal(BoundsSizeCm, LocalPosition);
+	float CornerWeight =
+		1.0 - saturate(abs(Offset.x - Offset.y) * 0.06);
+	FaceWeight =
+		1.0 - smoothstep(0.0, 1.0, FaceWeight);
+	FaceWeight *= 1.0 - CornerWeight;
+	float3 SmoothLocalNormal =
+		normalize(
+			LocalNormal * (1.0 - FaceWeight)
+			+ FaceNormal * FaceWeight);
+	float3 SmoothWorldNormal = SmoothLocalNormal;
+	return normalize(
+		WorldNormal
+		+ SmoothWorldNormal
+			* 6.0
+			* max(0.0, dot(WorldNormal, SmoothWorldNormal)));
+}
+
+float Modulo(float Value, float Divisor)
+{
+	return Value - Divisor * floor(Value / Divisor);
+}
+
+float3 RGBToHSV(float3 RGB)
+{
+	float4 K = float4(
+		0.0,
+		-1.0 / 3.0,
+		2.0 / 3.0,
+		-1.0);
+	float4 P =
+		RGB.g < RGB.b
+			? float4(RGB.bg, K.wz)
+			: float4(RGB.gb, K.xy);
+	float4 Q =
+		RGB.r < P.x
+			? float4(P.xyw, RGB.r)
+			: float4(RGB.r, P.yzx);
+	float D = Q.x - min(Q.w, Q.y);
+	return float3(
+		abs(Q.z + (Q.w - Q.y) / (6.0 * D + 1.0e-10)),
+		D / (Q.x + 1.0e-10),
+		Q.x);
+}
+
+float3 HSVToRGB(float3 HSV)
+{
+	float4 K = float4(
+		1.0,
+		2.0 / 3.0,
+		1.0 / 3.0,
+		3.0);
+	float3 P =
+		abs(frac(HSV.xxx + K.xyz) * 6.0 - K.www);
+	return HSV.z
+		* lerp(K.xxx, saturate(P - K.xxx), HSV.y);
+}
+
+float3 TweakHSV(float3 Colour, float3 Shift)
+{
+	return saturate(HSVToRGB(RGBToHSV(Colour) + Shift));
+}
+
+uint EnvironmentRandom(inout uint State)
+{
+	State = State * 747796405u + 2891336453u;
+	uint Result =
+		((State >> ((State >> 28u) + 4u)) ^ State)
+		* 277803737u;
+	return (Result >> 22u) ^ Result;
+}
+
+float EnvironmentRandomSigned(inout uint State)
+{
+	return (EnvironmentRandom(State) / 4294967295.0)
+		* 2.0 - 1.0;
+}
+
+float3 SampleSourceSky(float3 Direction)
+{
+	const float3 GroundColour =
+		float3(0.35, 0.3, 0.35) * 0.53;
+	const float3 HorizonColour = float3(1.0, 1.0, 1.0);
+	const float3 ZenithColour =
+		float3(0.08, 0.37, 0.73);
+	float Sun =
+		pow(max(0.0, dot(Direction, DirToSunWorld)), 1500.0)
+		* 16.0;
+	float SkyGradientWeight =
+		pow(smoothstep(0.0, 0.4, Direction.z), 0.35);
+	float GroundToSkyWeight =
+		smoothstep(-0.01, 0.0, Direction.z);
+	float3 SkyGradient =
+		lerp(
+			HorizonColour,
+			ZenithColour,
+			SkyGradientWeight);
+	return lerp(
+			GroundColour,
+			SkyGradient,
+			GroundToSkyWeight)
+		+ Sun * (GroundToSkyWeight >= 1.0);
+}
+
+float SampleSourceShadow(float3 TranslatedLocalPosition)
+{
+	float3 SourcePosition =
+		TranslatedLocalPosition - float3(0.0, 0.0, 500.0);
+	float2 ShadowUV = float2(
+		dot(SourcePosition, SourceShadowRight)
+			/ (2.0 * SourceShadowHalfWidthCm)
+			+ 0.5,
+		dot(SourcePosition, SourceShadowUp)
+			/ (2.0 * SourceShadowHalfHeightCm)
+			+ 0.5);
+	if (any(ShadowUV < 0.0) || any(ShadowUV > 1.0))
+	{
+		return 0.0;
+	}
+
+	float2 PixelPosition =
+		ShadowUV * float2(ShadowSize) - 0.5;
+	int2 Pixel00 =
+		clamp(
+			(int2)floor(PixelPosition),
+			int2(0, 0),
+			ShadowSize - 1);
+	int2 Pixel11 =
+		min(Pixel00 + 1, ShadowSize - 1);
+	float2 Blend = frac(PixelPosition);
+	float Sample00 =
+		asfloat(
+			ShadowBuffer[
+				(uint)Pixel00.y * (uint)ShadowSize.x
+				+ (uint)Pixel00.x]);
+	float Sample10 =
+		asfloat(
+			ShadowBuffer[
+				(uint)Pixel00.y * (uint)ShadowSize.x
+				+ (uint)Pixel11.x]);
+	float Sample01 =
+		asfloat(
+			ShadowBuffer[
+				(uint)Pixel11.y * (uint)ShadowSize.x
+				+ (uint)Pixel00.x]);
+	float Sample11 =
+		asfloat(
+			ShadowBuffer[
+				(uint)Pixel11.y * (uint)ShadowSize.x
+				+ (uint)Pixel11.x]);
+	return lerp(
+		lerp(Sample00, Sample10, Blend.x),
+		lerp(Sample01, Sample11, Blend.x),
+		Blend.y);
+}
+
+float3 SampleSourceEnvironment(
+	float3 WorldPosition,
+	float3 WorldDirection)
+{
+	float3 LocalPosition =
+		WorldPosition - SimulationOriginWorld;
+	float3 LocalDirection = WorldDirection;
+	float FloorDistance =
+		(2.5 - LocalPosition.z)
+		/ min(LocalDirection.z, -0.000001);
+	float3 FloorPoint =
+		LocalPosition + LocalDirection * FloorDistance;
+	bool DidHitFloor =
+		LocalDirection.z < 0.0
+		&& FloorDistance > 0.0
+		&& abs(FloorPoint.x) <= 3000.0
+		&& abs(FloorPoint.y) <= 3000.0;
+	if (DidHitFloor)
+	{
+		float3 TileColour =
+			FloorPoint.x < 0.0
+				? float3(0.14057493, 0.3679245, 0.16709903)
+				: float3(0.07164471, 0.19658183, 0.4339623);
+		if (FloorPoint.y < 0.0)
+		{
+			TileColour =
+				FloorPoint.x < 0.0
+					? float3(0.5647059, 0.4683025, 0.25490198)
+					: float3(0.424268, 0.27100393, 0.6603774);
+		}
+
+		int2 TileCoordinate =
+			(int2)floor(FloorPoint.xy * 0.0087);
+		bool IsDarkTile =
+			Modulo(TileCoordinate.x, 2.0)
+			== Modulo(TileCoordinate.y, 2.0);
+		TileColour =
+			TweakHSV(
+				TileColour,
+				float3(0.0, 0.0, 0.2 * IsDarkTile));
+		uint RandomState =
+			(uint)(TileCoordinate.x * 5023
+				+ TileCoordinate.y * 96456);
+		float3 RandomVariation =
+			float3(
+				EnvironmentRandomSigned(RandomState),
+				EnvironmentRandomSigned(RandomState),
+				EnvironmentRandomSigned(RandomState))
+			* float3(0.2, 0.0, 0.73)
+			* 0.1;
+		TileColour = TweakHSV(TileColour, RandomVariation);
+		float ShadowAmount = SampleSourceShadow(FloorPoint);
+		float3 ShadowTransmission =
+			exp(
+				-ShadowAmount
+				* ExtinctionCoefficients
+				* ExtinctionMultiplier);
+		const float AmbientLight = 0.17;
+		ShadowTransmission =
+			ShadowTransmission * (1.0 - AmbientLight)
+			+ AmbientLight;
+		return TileColour * ShadowTransmission;
+	}
+	return SampleSourceSky(WorldDirection);
+}
+
+float3 SampleSourceEnvironmentAA(
+	float3 WorldPosition,
+	float3 WorldDirection)
+{
+	float3 Sum = 0.0;
+	for (int OffsetX = -1; OffsetX <= 1; ++OffsetX)
+	{
+		for (int OffsetY = -1; OffsetY <= 1; ++OffsetY)
+		{
+			float3 JitteredDirection =
+				normalize(
+					WorldDirection
+					+ (CameraRightWorld * OffsetX
+						+ CameraUpWorld * OffsetY)
+						* 0.7 / ViewSize.x);
+			Sum +=
+				SampleSourceEnvironment(
+					WorldPosition,
+					JitteredDirection);
+		}
+	}
+	return Sum / 9.0;
+}
+
+float FresnelReflectance(
+	float3 IncomingDirection,
+	float3 Normal,
+	float IndexA,
+	float IndexB)
+{
+	float Ratio = IndexA / IndexB;
+	float CosineIncoming =
+		-dot(IncomingDirection, Normal);
+	float SineSquaredRefraction =
+		Ratio
+		* Ratio
+		* (1.0 - CosineIncoming * CosineIncoming);
+	if (SineSquaredRefraction >= 1.0)
+	{
+		return 1.0;
+	}
+	float CosineRefraction =
+		sqrt(1.0 - SineSquaredRefraction);
+	float Perpendicular =
+		(IndexA * CosineIncoming
+			- IndexB * CosineRefraction)
+		/ (IndexA * CosineIncoming
+			+ IndexB * CosineRefraction);
+	float Parallel =
+		(IndexB * CosineIncoming
+			- IndexA * CosineRefraction)
+		/ (IndexB * CosineIncoming
+			+ IndexA * CosineRefraction);
+	return (
+		Perpendicular * Perpendicular
+		+ Parallel * Parallel)
+		* 0.5;
+}
+
+float3 SourceRefract(
+	float3 IncomingDirection,
+	float3 Normal,
+	float IndexA,
+	float IndexB)
+{
+	float Ratio = IndexA / IndexB;
+	float CosineIncoming =
+		-dot(IncomingDirection, Normal);
+	float SineSquaredRefraction =
+		Ratio
+		* Ratio
+		* (1.0 - CosineIncoming * CosineIncoming);
+	if (SineSquaredRefraction > 1.0)
+	{
+		return 0.0;
+	}
+	return Ratio * IncomingDirection
+		+ (Ratio * CosineIncoming
+			- sqrt(1.0 - SineSquaredRefraction))
+			* Normal;
+}
+
+float4 ScreenCompositePS(FScreenCompositeVSToPS Input) : SV_Target0
+{
+	int2 Pixel = clamp(
+		int2(Input.Position.xy),
+		int2(0, 0),
+		ViewSize - 1);
+	float2 UV = PixelUV(Pixel);
+	uint PixelIndex =
+		(uint)Pixel.y * (uint)ViewSize.x + (uint)Pixel.x;
+	if (UV.y >= 0.995)
+	{
+		float FoamUsage = FoamMax > 0u
+			? WhiteParticleCounters[0] / (float)FoamMax
+			: 0.0;
+		float Bar = UV.x < FoamUsage ? 1.0 : 0.0;
+		return float4(Bar, Bar, Bar, Bar);
+	}
+	float FluidDepth =
+		asfloat(FluidDepthBuffer[PixelIndex]);
+	float FoamDepth =
+		asfloat(FoamDepthBuffer[PixelIndex]);
+	float Foam =
+		saturate(FoamMaskBuffer[PixelIndex] / 2000.0);
+	float3 ViewDirection = WorldViewDirection(UV);
+	float3 CameraPosition = CameraPositionWorld;
+	float3 Environment =
+		SampleSourceEnvironmentAA(
+			CameraPosition,
+			ViewDirection);
+
+	if (FluidDepth >= 65000.0)
+	{
+		float3 SourceColour =
+			lerp(Environment, float3(1.0, 1.0, 1.0), Foam);
+		return float4(
+			LinearToSrgb(max(0.0, SourceColour)),
+			1.0);
+	}
+
+	float Thickness =
+		asfloat(SmoothedThicknessBuffer[PixelIndex]);
+	float3 HitPosition =
+		CameraPosition + ViewDirection * FluidDepth;
+	float3 Normal =
+		FluidNormalFromDepth(
+			Pixel,
+			FluidDepth,
+			ViewDirection);
+	Normal =
+		SmoothBoundsEdgeNormal(
+			Normal,
+			HitPosition);
+
+	float ReflectionWeight =
+		FresnelReflectance(
+			ViewDirection,
+			Normal,
+			1.0,
+			1.33);
+	float RefractionWeight =
+		1.0 - ReflectionWeight;
+	float3 ReflectionDirection =
+		reflect(ViewDirection, Normal);
+	float3 RefractionDirection =
+		SourceRefract(
+			ViewDirection,
+			Normal,
+			1.0,
+			1.33);
+
+	float3 ExitPosition =
+		HitPosition
+		+ RefractionDirection
+			* Thickness
+			* RefractionMultiplier
+			* 100.0;
+	float3 LocalExitPosition =
+		ExitPosition - SimulationOriginWorld;
+	float3 LocalRefractionDirection =
+		RefractionDirection;
+	if (LocalRefractionDirection.z < -0.0001)
+	{
+		float FloorCorrection =
+			max(0.0, 2.5 - LocalExitPosition.z)
+			/ LocalRefractionDirection.z;
+		ExitPosition +=
+			RefractionDirection * FloorCorrection;
+	}
+
+	float3 Transmission =
+		exp(
+			-max(0.0, Thickness)
+			* ExtinctionCoefficients
+			* ExtinctionMultiplier);
+	float3 ReflectionColour =
+		SampleSourceEnvironmentAA(
+			HitPosition,
+			ReflectionDirection);
+	float3 RefractionColour =
+		SampleSourceEnvironmentAA(
+			ExitPosition,
+			ViewDirection);
+	RefractionColour =
+		lerp(
+			RefractionColour,
+			float3(1.0, 1.0, 1.0),
+			Foam);
+	RefractionColour *= Transmission;
+	if (FoamDepth < FluidDepth)
+	{
+		ReflectionColour =
+			lerp(
+				ReflectionColour,
+				float3(1.0, 1.0, 1.0),
+				Foam);
+	}
+
+	float3 SourceColour =
+		lerp(
+			ReflectionColour,
+			RefractionColour,
+			RefractionWeight);
+	return float4(
+		LinearToSrgb(max(0.0, SourceColour)),
+		1.0);
+}

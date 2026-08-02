@@ -1,0 +1,1171 @@
+#include "/Engine/Public/Platform.ush"
+#include "/WaterSimulation/Private/MarchingCubesTables.ush"
+
+static const uint ParticleThreadGroupSize = 256;
+static const uint ScanThreadGroupSize = 256;
+static const uint ScanItemsPerGroup = ScanThreadGroupSize * 2;
+static const float PI = 3.14159265359;
+
+uint NumParticles;
+uint NumInputs;
+uint ItemCount;
+uint ParticlesPerAxis;
+uint SpawnRegionCount;
+uint MaxWhiteParticleCount;
+uint FoamActive;
+int3 SurfaceGridSize;
+
+float DeltaTime;
+float Gravity;
+float SmoothingRadius;
+float TargetDensity;
+float PressureMultiplier;
+float NearPressureMultiplier;
+float ViscosityStrength;
+float CollisionDamping;
+float SpawnSize;
+float JitterStrength;
+float KSpikyPow2;
+float KSpikyPow3;
+float KSpikyPow2Grad;
+float KSpikyPow3Grad;
+float RenderRadiusCm;
+float SimulationToCentimeters;
+float SurfaceIsoLevel;
+float SimTime;
+float TrappedAirSpawnRate;
+float BubbleScale;
+float WhiteParticleDeltaTime;
+float BubbleBuoyancy;
+float BubbleScaleChangeSpeed;
+int SprayClassifyMaxNeighbours;
+int BubbleClassifyMinNeighbours;
+
+float3 SpawnCenter;
+float3 SecondSpawnCenter;
+float3 BoundsSize;
+float3 BoundsCenter;
+float3 ContainerVelocityDelta;
+float2 TrappedAirVelocityMinMax;
+float2 KineticEnergyMinMax;
+
+RWStructuredBuffer<float4> Positions;
+RWStructuredBuffer<float4> PredictedPositions;
+RWStructuredBuffer<float4> Velocities;
+RWStructuredBuffer<float2> Densities;
+
+RWStructuredBuffer<uint> SpatialKeys;
+RWStructuredBuffer<uint> SpatialOffsets;
+RWStructuredBuffer<uint> SortedIndices;
+RWStructuredBuffer<uint> Counts;
+RWStructuredBuffer<uint> InputItems;
+RWStructuredBuffer<uint> InputKeys;
+RWStructuredBuffer<uint> SortedItems;
+RWStructuredBuffer<uint> SortedKeys;
+RWStructuredBuffer<uint> Elements;
+RWStructuredBuffer<uint> GroupSums;
+
+RWStructuredBuffer<float4> SortTargetPositions;
+RWStructuredBuffer<float4> SortTargetPredictedPositions;
+RWStructuredBuffer<float4> SortTargetVelocities;
+RWStructuredBuffer<float> DensityGrid;
+RWStructuredBuffer<int> MarchingCubesLUT;
+struct FSPHWhiteParticle
+{
+	float4 PositionLifetime;
+	float4 VelocityScale;
+};
+
+RWStructuredBuffer<FSPHWhiteParticle> WhiteParticles;
+RWStructuredBuffer<FSPHWhiteParticle> WhiteParticlesCompacted;
+RWStructuredBuffer<uint> WhiteParticleCounters;
+
+RWBuffer<float> OutputPositions;
+RWBuffer<float4> OutputTangents;
+RWBuffer<uint> WhiteParticleDrawArgs;
+
+static const int3 NeighbourOffsets3D[27] =
+{
+	int3(-1, -1, -1), int3(0, -1, -1), int3(1, -1, -1),
+	int3(-1,  0, -1), int3(0,  0, -1), int3(1,  0, -1),
+	int3(-1,  1, -1), int3(0,  1, -1), int3(1,  1, -1),
+	int3(-1, -1,  0), int3(0, -1,  0), int3(1, -1,  0),
+	int3(-1,  0,  0), int3(0,  0,  0), int3(1,  0,  0),
+	int3(-1,  1,  0), int3(0,  1,  0), int3(1,  1,  0),
+	int3(-1, -1,  1), int3(0, -1,  1), int3(1, -1,  1),
+	int3(-1,  0,  1), int3(0,  0,  1), int3(1,  0,  1),
+	int3(-1,  1,  1), int3(0,  1,  1), int3(1,  1,  1)
+};
+
+int3 GetCell3D(float3 Position, float Radius)
+{
+	// Recover the source Unity coordinate order before hashing. The UE
+	// simulation stores (source X, source Z, source Y + 5 m).
+	float3 SourcePosition =
+		float3(Position.x, Position.z - 5.0, Position.y);
+	return (int3)floor(SourcePosition / Radius);
+}
+
+uint HashCell3D(int3 Cell)
+{
+	static const uint HashK1 = 15823;
+	static const uint HashK2 = 9737333;
+	static const uint HashK3 = 440817757;
+	static const uint BlockSize = 50;
+
+	uint3 UnsignedCell = (uint3)(Cell + (int)(BlockSize / 2));
+	uint3 LocalCell = UnsignedCell % BlockSize;
+	uint3 BlockID = UnsignedCell / BlockSize;
+	uint BlockHash = BlockID.x * HashK1 + BlockID.y * HashK2 + BlockID.z * HashK3;
+	return LocalCell.x
+		+ BlockSize * (LocalCell.y + BlockSize * LocalCell.z)
+		+ BlockHash;
+}
+
+uint KeyFromHash(uint Hash)
+{
+	return Hash % NumParticles;
+}
+
+float DensityKernel(float Distance, float Radius)
+{
+	if (Distance < Radius)
+	{
+		float Value = Radius - Distance;
+		return Value * Value * KSpikyPow2;
+	}
+	return 0.0;
+}
+
+float NearDensityKernel(float Distance, float Radius)
+{
+	if (Distance < Radius)
+	{
+		float Value = Radius - Distance;
+		return Value * Value * Value * KSpikyPow3;
+	}
+	return 0.0;
+}
+
+float DensityDerivative(float Distance, float Radius)
+{
+	if (Distance <= Radius)
+	{
+		return -(Radius - Distance) * KSpikyPow2Grad;
+	}
+	return 0.0;
+}
+
+float NearDensityDerivative(float Distance, float Radius)
+{
+	if (Distance <= Radius)
+	{
+		float Value = Radius - Distance;
+		return -Value * Value * KSpikyPow3Grad;
+	}
+	return 0.0;
+}
+
+float SmoothingKernelPoly6(float Distance, float Radius)
+{
+	if (Distance < Radius)
+	{
+		float Scale = 315.0 / (64.0 * PI * pow(abs(Radius), 9.0));
+		float Value = Radius * Radius - Distance * Distance;
+		return Value * Value * Value * Scale;
+	}
+	return 0.0;
+}
+
+uint PCGHash(uint State)
+{
+	State = State * 747796405u + 2891336453u;
+	uint Result = ((State >> ((State >> 28u) + 4u)) ^ State) * 277803737u;
+	return (Result >> 22u) ^ Result;
+}
+
+float RandomSigned(uint Seed)
+{
+	return (PCGHash(Seed) / 4294967295.0) * 2.0 - 1.0;
+}
+
+uint NextRandom(inout uint State)
+{
+	State = State * 747796405u + 2891336453u;
+	uint Result =
+		((State >> ((State >> 28u) + 4u)) ^ State) * 277803737u;
+	return (Result >> 22u) ^ Result;
+}
+
+float RandomValue(inout uint State)
+{
+	return NextRandom(State) / 4294967295.0;
+}
+
+float Remap01(float Value, float Minimum, float Maximum)
+{
+	return saturate((Value - Minimum) / max(1.0e-6, Maximum - Minimum));
+}
+
+float3 ToSourceDirection(float3 Direction)
+{
+	return float3(Direction.x, Direction.z, Direction.y);
+}
+
+float3 FromSourceDirection(float3 Direction)
+{
+	return float3(Direction.x, Direction.z, Direction.y);
+}
+
+float3 CalculateOrthonormal(float3 Direction)
+{
+	float3 SourceDirection = ToSourceDirection(Direction);
+	float A =
+		sign((sign(SourceDirection.x) + 0.5)
+			* (sign(SourceDirection.z) + 0.5));
+	float B =
+		sign((sign(SourceDirection.y) + 0.5)
+			* (sign(SourceDirection.z) + 0.5));
+	float3 SourceOrthonormal = float3(
+		A * SourceDirection.z,
+		B * SourceDirection.z,
+		-A * SourceDirection.x - B * SourceDirection.y);
+	return FromSourceDirection(normalize(SourceOrthonormal));
+}
+
+void ResolveBoxCollision(
+	inout float3 Position,
+	inout float3 Velocity,
+	float Damping)
+{
+	float3 RelativePosition = Position - BoundsCenter;
+	float3 HalfBounds = BoundsSize * 0.5;
+	float3 EdgeDistance = HalfBounds - abs(RelativePosition);
+
+	if (EdgeDistance.x <= 0.0)
+	{
+		RelativePosition.x = HalfBounds.x * sign(RelativePosition.x);
+		Velocity.x *= -Damping;
+	}
+	if (EdgeDistance.y <= 0.0)
+	{
+		RelativePosition.y = HalfBounds.y * sign(RelativePosition.y);
+		Velocity.y *= -Damping;
+	}
+	if (EdgeDistance.z <= 0.0)
+	{
+		RelativePosition.z = HalfBounds.z * sign(RelativePosition.z);
+		Velocity.z *= -Damping;
+	}
+
+	Position = RelativePosition + BoundsCenter;
+}
+
+float2 CalculateDensitiesAtPoint(float3 Position)
+{
+	int3 OriginCell = GetCell3D(Position, SmoothingRadius);
+	float RadiusSquared = SmoothingRadius * SmoothingRadius;
+	float Density = 0.0;
+	float NearDensity = 0.0;
+
+	[unroll]
+	for (int OffsetIndex = 0; OffsetIndex < 27; ++OffsetIndex)
+	{
+		uint Key = KeyFromHash(HashCell3D(OriginCell + NeighbourOffsets3D[OffsetIndex]));
+		uint CurrentIndex = SpatialOffsets[Key];
+
+		while (CurrentIndex < NumParticles)
+		{
+			uint NeighbourIndex = CurrentIndex++;
+			if (SpatialKeys[NeighbourIndex] != Key)
+			{
+				break;
+			}
+
+			float3 Offset = PredictedPositions[NeighbourIndex].xyz - Position;
+			float DistanceSquared = dot(Offset, Offset);
+			if (DistanceSquared > RadiusSquared)
+			{
+				continue;
+			}
+
+			float Distance = sqrt(DistanceSquared);
+			Density += DensityKernel(Distance, SmoothingRadius);
+			NearDensity += NearDensityKernel(Distance, SmoothingRadius);
+		}
+	}
+
+	return float2(Density, NearDensity);
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void InitializeParticles(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+
+	uint ParticlesPerRegion =
+		ParticlesPerAxis * ParticlesPerAxis * ParticlesPerAxis;
+	uint RegionIndex = min(
+		Index / max(1u, ParticlesPerRegion),
+		max(1u, SpawnRegionCount) - 1u);
+	uint LocalIndex = Index - RegionIndex * ParticlesPerRegion;
+	uint AxisSquared = ParticlesPerAxis * ParticlesPerAxis;
+	uint X = LocalIndex / AxisSquared;
+	uint Remainder = LocalIndex - X * AxisSquared;
+	uint Y = Remainder / ParticlesPerAxis;
+	uint Z = Remainder - Y * ParticlesPerAxis;
+	float Denominator = max(1.0, (float)(ParticlesPerAxis - 1));
+	float3 SourceT = float3(X, Y, Z) / Denominator;
+	float3 T = float3(SourceT.x, SourceT.z, SourceT.y);
+
+	uint Seed = Index * 9781u + 6271u;
+	float JitterZ = RandomSigned(Seed + 17u);
+	float JitterAngle =
+		(RandomSigned(Seed + 31u) * 0.5 + 0.5)
+		* 2.0 * PI;
+	float JitterPlanarRadius =
+		sqrt(max(0.0, 1.0 - JitterZ * JitterZ));
+	float3 SourceJitterDirection = float3(
+		cos(JitterAngle) * JitterPlanarRadius,
+		sin(JitterAngle) * JitterPlanarRadius,
+		JitterZ);
+	float3 JitterDirection = FromSourceDirection(SourceJitterDirection);
+	float JitterRadius =
+		pow(
+			saturate(
+				RandomSigned(Seed + 47u) * 0.5 + 0.5),
+			1.0 / 3.0);
+	float3 Jitter =
+		JitterDirection * JitterRadius * JitterStrength;
+
+	float3 RegionCenter =
+		RegionIndex == 0u ? SpawnCenter : SecondSpawnCenter;
+	float3 Position = RegionCenter + (T - 0.5) * SpawnSize + Jitter;
+	Positions[Index] = float4(Position, 1.0);
+	PredictedPositions[Index] = float4(Position, 1.0);
+	Velocities[Index] = 0.0;
+	Densities[Index] = 0.0;
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void ExternalForces(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+
+	float3 Velocity = Velocities[Index].xyz;
+	// Particles live in the translating container frame. Applying the
+	// opposite container velocity change preserves their world-space inertia
+	// and lets the moving walls generate the slosh.
+	Velocity += ContainerVelocityDelta;
+	Velocity += float3(0.0, 0.0, Gravity) * DeltaTime;
+	Velocities[Index] = float4(Velocity, 0.0);
+	PredictedPositions[Index] =
+		float4(Positions[Index].xyz + Velocity * (1.0 / 120.0), 1.0);
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void UpdateSpatialHash(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+
+	int3 Cell = GetCell3D(PredictedPositions[Index].xyz, SmoothingRadius);
+	SpatialKeys[Index] = KeyFromHash(HashCell3D(Cell));
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void ClearCounts(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumInputs)
+	{
+		return;
+	}
+	Counts[Index] = 0;
+	InputItems[Index] = Index;
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void CalculateCounts(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumInputs)
+	{
+		return;
+	}
+	InterlockedAdd(Counts[InputKeys[Index]], 1);
+}
+
+groupshared uint ScanTemp[ScanItemsPerGroup];
+
+[numthreads(ScanThreadGroupSize, 1, 1)]
+void BlockScan(
+	uint ThreadGlobal : SV_DispatchThreadID,
+	uint ThreadLocal : SV_GroupThreadID,
+	uint Group : SV_GroupID)
+{
+	uint LocalA = ThreadLocal * 2 + 0;
+	uint LocalB = ThreadLocal * 2 + 1;
+	uint GlobalA = ThreadGlobal * 2 + 0;
+	uint GlobalB = ThreadGlobal * 2 + 1;
+	bool HasA = GlobalA < ItemCount;
+	bool HasB = GlobalB < ItemCount;
+
+	ScanTemp[LocalA] = HasA ? Elements[GlobalA] : 0;
+	ScanTemp[LocalB] = HasB ? Elements[GlobalB] : 0;
+
+	uint Offset = 1;
+	for (uint ActiveThreads = ScanThreadGroupSize;
+		ActiveThreads > 0;
+		ActiveThreads /= 2)
+	{
+		GroupMemoryBarrierWithGroupSync();
+		if (ThreadLocal < ActiveThreads)
+		{
+			uint IndexA = Offset * (LocalA + 1) - 1;
+			uint IndexB = Offset * (LocalB + 1) - 1;
+			ScanTemp[IndexB] = ScanTemp[IndexA] + ScanTemp[IndexB];
+		}
+		Offset *= 2;
+	}
+
+	if (ThreadLocal == 0)
+	{
+		GroupSums[Group] = ScanTemp[ScanItemsPerGroup - 1];
+		ScanTemp[ScanItemsPerGroup - 1] = 0;
+	}
+
+	for (uint ActiveThreads = 1;
+		ActiveThreads <= ScanThreadGroupSize;
+		ActiveThreads *= 2)
+	{
+		GroupMemoryBarrierWithGroupSync();
+		Offset /= 2;
+		if (ThreadLocal < ActiveThreads)
+		{
+			uint IndexA = Offset * (LocalA + 1) - 1;
+			uint IndexB = Offset * (LocalB + 1) - 1;
+			uint Sum = ScanTemp[IndexA] + ScanTemp[IndexB];
+			ScanTemp[IndexA] = ScanTemp[IndexB];
+			ScanTemp[IndexB] = Sum;
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+	if (HasA)
+	{
+		Elements[GlobalA] = ScanTemp[LocalA];
+	}
+	if (HasB)
+	{
+		Elements[GlobalB] = ScanTemp[LocalB];
+	}
+}
+
+[numthreads(ScanThreadGroupSize, 1, 1)]
+void BlockCombine(uint ThreadGlobal : SV_DispatchThreadID, uint Group : SV_GroupID)
+{
+	uint GlobalA = ThreadGlobal * 2 + 0;
+	uint GlobalB = ThreadGlobal * 2 + 1;
+	if (GlobalA < ItemCount)
+	{
+		Elements[GlobalA] += GroupSums[Group];
+	}
+	if (GlobalB < ItemCount)
+	{
+		Elements[GlobalB] += GroupSums[Group];
+	}
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void ScatterOutput(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumInputs)
+	{
+		return;
+	}
+
+	uint Key = InputKeys[Index];
+	uint SortedIndex;
+	InterlockedAdd(Counts[Key], 1, SortedIndex);
+	SortedItems[SortedIndex] = InputItems[Index];
+	SortedKeys[SortedIndex] = Key;
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void SortCopyBack(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumInputs)
+	{
+		return;
+	}
+	InputItems[Index] = SortedItems[Index];
+	InputKeys[Index] = SortedKeys[Index];
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void InitializeOffsets(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index < NumInputs)
+	{
+		SpatialOffsets[Index] = NumInputs;
+	}
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void CalculateOffsets(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumInputs)
+	{
+		return;
+	}
+
+	uint Key = SpatialKeys[Index];
+	uint PreviousKey = Index == 0 ? NumInputs : SpatialKeys[Index - 1];
+	if (Key != PreviousKey)
+	{
+		SpatialOffsets[Key] = Index;
+	}
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void ReorderParticles(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+
+	uint SourceIndex = SortedIndices[Index];
+	SortTargetPositions[Index] = Positions[SourceIndex];
+	SortTargetPredictedPositions[Index] = PredictedPositions[SourceIndex];
+	SortTargetVelocities[Index] = Velocities[SourceIndex];
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void ReorderCopyBack(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+	Positions[Index] = SortTargetPositions[Index];
+	PredictedPositions[Index] = SortTargetPredictedPositions[Index];
+	Velocities[Index] = SortTargetVelocities[Index];
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void CalculateDensities(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index < NumParticles)
+	{
+		Densities[Index] =
+			CalculateDensitiesAtPoint(PredictedPositions[Index].xyz);
+	}
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void CalculatePressureForce(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+
+	float Density = max(Densities[Index].x, 1.0e-6);
+	float NearDensity = Densities[Index].y;
+	float Pressure = (Density - TargetDensity) * PressureMultiplier;
+	float NearPressure = NearDensity * NearPressureMultiplier;
+	float3 PressureForce = 0.0;
+	float3 Position = PredictedPositions[Index].xyz;
+	float3 Velocity = Velocities[Index].xyz;
+	int3 OriginCell = GetCell3D(Position, SmoothingRadius);
+	float RadiusSquared = SmoothingRadius * SmoothingRadius;
+	uint NeighbourCount = 0;
+	float WeightedVelocityDifference = 0.0;
+
+	[unroll]
+	for (int OffsetIndex = 0; OffsetIndex < 27; ++OffsetIndex)
+	{
+		uint Key = KeyFromHash(HashCell3D(OriginCell + NeighbourOffsets3D[OffsetIndex]));
+		uint CurrentIndex = SpatialOffsets[Key];
+		while (CurrentIndex < NumParticles)
+		{
+			uint NeighbourIndex = CurrentIndex++;
+			if (NeighbourIndex == Index)
+			{
+				continue;
+			}
+			if (SpatialKeys[NeighbourIndex] != Key)
+			{
+				break;
+			}
+
+			float3 Offset = PredictedPositions[NeighbourIndex].xyz - Position;
+			float DistanceSquared = dot(Offset, Offset);
+			if (DistanceSquared > RadiusSquared)
+			{
+				continue;
+			}
+
+			float NeighbourDensity = max(Densities[NeighbourIndex].x, 1.0e-6);
+			float NeighbourNearDensity = Densities[NeighbourIndex].y;
+			float NeighbourPressure =
+				(NeighbourDensity - TargetDensity) * PressureMultiplier;
+			float NeighbourNearPressure =
+				NeighbourNearDensity * NearPressureMultiplier;
+			float SharedPressure = (Pressure + NeighbourPressure) * 0.5;
+			float SharedNearPressure =
+				(NearPressure + NeighbourNearPressure) * 0.5;
+			float Distance = sqrt(DistanceSquared);
+			float3 Direction = Distance > 0.0
+				? Offset / Distance
+				: float3(0.0, 0.0, 1.0);
+
+			PressureForce += Direction
+				* DensityDerivative(Distance, SmoothingRadius)
+				* SharedPressure
+				/ NeighbourDensity;
+			PressureForce += Direction
+				* NearDensityDerivative(Distance, SmoothingRadius)
+				* SharedNearPressure
+				/ max(NeighbourNearDensity, 1.0e-6);
+			NeighbourCount++;
+
+			float3 RelativeVelocity =
+				Velocity - Velocities[NeighbourIndex].xyz;
+			float RelativeVelocityMagnitude = length(RelativeVelocity);
+			float3 RelativeVelocityDirection =
+				RelativeVelocity
+				/ max(1.0e-6, RelativeVelocityMagnitude);
+			float ConvergeWeight =
+				1.0 - dot(RelativeVelocityDirection, -Direction);
+			float Influence =
+				1.0 - min(1.0, Distance / SmoothingRadius);
+			WeightedVelocityDifference +=
+				RelativeVelocityMagnitude * ConvergeWeight * Influence;
+		}
+	}
+
+	float3 VelocityNew =
+		Velocity + (PressureForce / Density) * DeltaTime;
+	Velocities[Index] = float4(VelocityNew, 0.0);
+	if (NeighbourCount < 8)
+	{
+		Velocities[Index] -=
+			Velocities[Index] * DeltaTime * 0.75;
+	}
+
+	if (FoamActive == 0u)
+	{
+		return;
+	}
+
+	if (Index == 0u)
+	{
+		WhiteParticleCounters[1] = 0u;
+	}
+
+	uint RandomState = dot(
+		asuint(float4(Position, SimTime)),
+		uint4(19349669u, 83492837u, 73856131u, 4785773u));
+	float TrappedAirFactor = TrappedAirSpawnRate
+		* Remap01(
+			WeightedVelocityDifference,
+			TrappedAirVelocityMinMax.x,
+			TrappedAirVelocityMinMax.y);
+	float KineticEnergyFactor = Remap01(
+		dot(Velocity, Velocity),
+		KineticEnergyMinMax.x,
+		KineticEnergyMinMax.y);
+	float SpawnFactor =
+		TrappedAirFactor * KineticEnergyFactor * DeltaTime;
+	uint SpawnCount = (uint)floor(SpawnFactor);
+	if (RandomValue(RandomState) < SpawnFactor - SpawnCount)
+	{
+		SpawnCount++;
+	}
+
+	if (SpawnCount > 0u)
+	{
+		uint FirstParticleIndex;
+		InterlockedAdd(
+			WhiteParticleCounters[0],
+			SpawnCount,
+			FirstParticleIndex);
+		if (FirstParticleIndex + 1u < MaxWhiteParticleCount)
+		{
+			SpawnCount = min(
+				SpawnCount,
+				MaxWhiteParticleCount - FirstParticleIndex - 1u);
+			float3 CylinderBase = Position;
+			float3 CylinderTop =
+				Position + VelocityNew * DeltaTime;
+			float3 CylinderAxisA =
+				CalculateOrthonormal(VelocityNew);
+			float3 CylinderAxisB = FromSourceDirection(
+				normalize(
+					cross(
+						ToSourceDirection(CylinderAxisA),
+						ToSourceDirection(VelocityNew))));
+			for (uint SpawnIndex = 0u;
+				SpawnIndex < SpawnCount;
+				++SpawnIndex)
+			{
+				float RandomAngle =
+					RandomValue(RandomState) * 2.0 * PI;
+				float3 OffsetDirection =
+					cos(RandomAngle) * CylinderAxisA
+					+ sin(RandomAngle) * CylinderAxisB;
+				float3 BaseOffset =
+					sqrt(RandomValue(RandomState))
+					* SmoothingRadius
+					* OffsetDirection;
+				float3 SpawnPosition =
+					CylinderBase
+					+ BaseOffset
+					+ (CylinderTop - CylinderBase)
+						* RandomValue(RandomState);
+				float Lifetime =
+					lerp(5.0, 15.0, RandomValue(RandomState));
+				uint WhiteIndex = FirstParticleIndex + SpawnIndex;
+				FSPHWhiteParticle WhiteParticle;
+				WhiteParticle.PositionLifetime =
+					float4(SpawnPosition, Lifetime);
+				WhiteParticle.VelocityScale =
+					float4(
+						VelocityNew + BaseOffset,
+						(BubbleScale + 1.0) * 0.5);
+				WhiteParticles[WhiteIndex] = WhiteParticle;
+			}
+		}
+	}
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void CalculateViscosity(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+
+	float3 Position = PredictedPositions[Index].xyz;
+	float3 Velocity = Velocities[Index].xyz;
+	float3 ViscosityForce = 0.0;
+	int3 OriginCell = GetCell3D(Position, SmoothingRadius);
+	float RadiusSquared = SmoothingRadius * SmoothingRadius;
+
+	[unroll]
+	for (int OffsetIndex = 0; OffsetIndex < 27; ++OffsetIndex)
+	{
+		uint Key = KeyFromHash(HashCell3D(OriginCell + NeighbourOffsets3D[OffsetIndex]));
+		uint CurrentIndex = SpatialOffsets[Key];
+		while (CurrentIndex < NumParticles)
+		{
+			uint NeighbourIndex = CurrentIndex++;
+			if (NeighbourIndex == Index)
+			{
+				continue;
+			}
+			if (SpatialKeys[NeighbourIndex] != Key)
+			{
+				break;
+			}
+
+			float3 Offset = PredictedPositions[NeighbourIndex].xyz - Position;
+			float DistanceSquared = dot(Offset, Offset);
+			if (DistanceSquared > RadiusSquared)
+			{
+				continue;
+			}
+
+			float Distance = sqrt(DistanceSquared);
+			ViscosityForce +=
+				(Velocities[NeighbourIndex].xyz - Velocity)
+				* SmoothingKernelPoly6(Distance, SmoothingRadius);
+		}
+	}
+
+	Velocities[Index] =
+		float4(Velocity + ViscosityForce * ViscosityStrength * DeltaTime, 0.0);
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void UpdatePositions(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= NumParticles)
+	{
+		return;
+	}
+
+	float3 Velocity = Velocities[Index].xyz;
+	float3 Position = Positions[Index].xyz + Velocity * DeltaTime;
+	ResolveBoxCollision(Position, Velocity, CollisionDamping);
+
+	Positions[Index] = float4(Position, 1.0);
+	Velocities[Index] = float4(Velocity, 0.0);
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void UpdateWhiteParticles(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	uint ActiveCount =
+		min(MaxWhiteParticleCount, WhiteParticleCounters[0]);
+	if (Index >= ActiveCount)
+	{
+		return;
+	}
+
+	FSPHWhiteParticle Particle = WhiteParticles[Index];
+	float4 PositionLifetime = Particle.PositionLifetime;
+	float4 VelocityScale = Particle.VelocityScale;
+	float3 Position = PositionLifetime.xyz;
+	float3 Velocity = VelocityScale.xyz;
+	Velocity += ContainerVelocityDelta;
+	float RadiusSquared = SmoothingRadius * SmoothingRadius;
+	int3 OriginCell = GetCell3D(Position, SmoothingRadius);
+	int NeighbourCount = 0;
+	float3 VelocitySum = 0.0;
+	float WeightSum = 0.0;
+
+	[unroll]
+	for (int OffsetIndex = 0; OffsetIndex < 27; ++OffsetIndex)
+	{
+		uint Key = KeyFromHash(
+			HashCell3D(OriginCell + NeighbourOffsets3D[OffsetIndex]));
+		uint CurrentIndex = SpatialOffsets[Key];
+		while (CurrentIndex < NumParticles)
+		{
+			uint NeighbourIndex = CurrentIndex++;
+			if (SpatialKeys[NeighbourIndex] != Key)
+			{
+				break;
+			}
+
+			float3 Offset =
+				PredictedPositions[NeighbourIndex].xyz - Position;
+			float DistanceSquared = dot(Offset, Offset);
+			if (DistanceSquared < RadiusSquared)
+			{
+				float Distance = sqrt(DistanceSquared);
+				float Weight =
+					SmoothingKernelPoly6(Distance, SmoothingRadius);
+				VelocitySum +=
+					Velocities[NeighbourIndex].xyz * Weight;
+				WeightSum += Weight;
+				NeighbourCount++;
+			}
+		}
+	}
+
+	bool IsSpray = NeighbourCount <= SprayClassifyMaxNeighbours;
+	bool IsBubble = NeighbourCount >= BubbleClassifyMinNeighbours;
+	bool IsFoam = !(IsSpray || IsBubble);
+	float Delta = WhiteParticleDeltaTime;
+
+	if (IsFoam)
+	{
+		Velocity = VelocitySum / max(1.0e-6, WeightSum);
+		PositionLifetime.w -= Delta;
+	}
+	else if (IsBubble)
+	{
+		float3 Buoyancy =
+			float3(0.0, 0.0, Gravity) * (1.0 - BubbleBuoyancy);
+		float3 FluidAcceleration =
+			(VelocitySum / max(1.0e-6, WeightSum) - Velocity) * 3.0;
+		Velocity += (Buoyancy + FluidAcceleration) * Delta;
+	}
+	else
+	{
+		float SpeedSquared = dot(Velocity, Velocity);
+		float3 Drag =
+			-normalize(Velocity + float3(0.0, 0.0, 1.0e-8))
+			* SpeedSquared
+			* 0.04;
+		Velocity += (float3(0.0, 0.0, Gravity) + Drag) * Delta;
+	}
+
+	float TargetScale = IsBubble ? BubbleScale : 1.0;
+	VelocityScale.w = lerp(
+		VelocityScale.w,
+		TargetScale,
+		Delta * BubbleScaleChangeSpeed);
+	Position += Velocity * Delta;
+	ResolveBoxCollision(Position, Velocity, 0.1);
+	PositionLifetime.xyz = Position;
+	VelocityScale.xyz = Velocity;
+	Particle.PositionLifetime = PositionLifetime;
+	Particle.VelocityScale = VelocityScale;
+	WhiteParticles[Index] = Particle;
+
+	if (PositionLifetime.w > 0.0)
+	{
+		uint SurvivorIndex;
+		InterlockedAdd(
+			WhiteParticleCounters[1],
+			1u,
+			SurvivorIndex);
+		if (SurvivorIndex < MaxWhiteParticleCount)
+		{
+			WhiteParticlesCompacted[SurvivorIndex] = Particle;
+		}
+	}
+}
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void WhiteParticlePrepareNextFrame(
+	uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadID.x;
+	if (Index >= MaxWhiteParticleCount)
+	{
+		return;
+	}
+
+	uint SurvivorCount =
+		min(MaxWhiteParticleCount, WhiteParticleCounters[1]);
+	if (Index < SurvivorCount)
+	{
+		WhiteParticles[Index] =
+			WhiteParticlesCompacted[Index];
+	}
+	if (Index == 0u)
+	{
+		WhiteParticleCounters[0] = SurvivorCount;
+	}
+}
+
+[numthreads(1, 1, 1)]
+void PrepareWhiteParticleDrawArgs(
+	uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	WhiteParticleDrawArgs[0] = 6u;
+	WhiteParticleDrawArgs[1] =
+		min(MaxWhiteParticleCount, WhiteParticleCounters[0]);
+	WhiteParticleDrawArgs[2] = 0u;
+	WhiteParticleDrawArgs[3] = 0u;
+}
+
+uint DensityGridIndex(uint3 Coordinate)
+{
+	return Coordinate.x
+		+ SurfaceGridSize.x
+			* (Coordinate.y + SurfaceGridSize.y * Coordinate.z);
+}
+
+float SampleSurfaceDensity(int3 Coordinate)
+{
+	int3 MaximumCoordinate = SurfaceGridSize - 1;
+	if (any(Coordinate < 0) || any(Coordinate > MaximumCoordinate))
+	{
+		return 0.0;
+	}
+	return DensityGrid[DensityGridIndex((uint3)Coordinate)];
+}
+
+float3 SurfaceCoordinateToPosition(int3 Coordinate)
+{
+	float3 UVW =
+		(float3)Coordinate / max(1.0, (float3)SurfaceGridSize - 1.0);
+	return BoundsCenter + (UVW - 0.5) * BoundsSize;
+}
+
+float3 CalculateSurfaceNormal(int3 Coordinate)
+{
+	float DX =
+		SampleSurfaceDensity(Coordinate + int3(1, 0, 0))
+		- SampleSurfaceDensity(Coordinate - int3(1, 0, 0));
+	float DY =
+		SampleSurfaceDensity(Coordinate + int3(0, 1, 0))
+		- SampleSurfaceDensity(Coordinate - int3(0, 1, 0));
+	float DZ =
+		SampleSurfaceDensity(Coordinate + int3(0, 0, 1))
+		- SampleSurfaceDensity(Coordinate - int3(0, 0, 1));
+	return normalize(-float3(DX, DY, DZ) + float3(0.0, 0.0, 1.0e-6));
+}
+
+void WriteSurfaceVertex(
+	uint VertexIndex,
+	float3 Position,
+	float3 Normal)
+{
+	float3 PositionCm = Position * SimulationToCentimeters;
+	OutputPositions[VertexIndex * 3 + 0] = PositionCm.x;
+	OutputPositions[VertexIndex * 3 + 1] = PositionCm.y;
+	OutputPositions[VertexIndex * 3 + 2] = PositionCm.z;
+
+	float3 Reference = abs(Normal.z) < 0.99
+		? float3(0.0, 0.0, 1.0)
+		: float3(0.0, 1.0, 0.0);
+	float3 Tangent = normalize(cross(Reference, Normal));
+	OutputTangents[VertexIndex * 2 + 0] = float4(Tangent, 1.0);
+	OutputTangents[VertexIndex * 2 + 1] = float4(Normal, 1.0);
+}
+
+void CreateSurfaceVertex(
+	uint VertexIndex,
+	int3 CoordinateA,
+	int3 CoordinateB)
+{
+	float DensityA = SampleSurfaceDensity(CoordinateA);
+	float DensityB = SampleSurfaceDensity(CoordinateB);
+	float Denominator = DensityB - DensityA;
+	float T = abs(Denominator) > 1.0e-6
+		? saturate((SurfaceIsoLevel - DensityA) / Denominator)
+		: 0.5;
+	float3 PositionA = SurfaceCoordinateToPosition(CoordinateA);
+	float3 PositionB = SurfaceCoordinateToPosition(CoordinateB);
+	float3 NormalA = CalculateSurfaceNormal(CoordinateA);
+	float3 NormalB = CalculateSurfaceNormal(CoordinateB);
+	WriteSurfaceVertex(
+		VertexIndex,
+		lerp(PositionA, PositionB, T),
+		normalize(lerp(NormalA, NormalB, T)));
+}
+
+[numthreads(4, 4, 4)]
+void SampleDensityGrid(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadID >= (uint3)SurfaceGridSize))
+	{
+		return;
+	}
+
+	if (any(DispatchThreadID == 0)
+		|| any(DispatchThreadID + 1 >= (uint3)SurfaceGridSize))
+	{
+		DensityGrid[DensityGridIndex(DispatchThreadID)] = 0.0;
+		return;
+	}
+
+	float3 UVW =
+		(float3)DispatchThreadID
+		/ max(1.0, (float3)SurfaceGridSize - 1.0);
+	float3 Position = BoundsCenter + (UVW - 0.5) * BoundsSize;
+	DensityGrid[DensityGridIndex(DispatchThreadID)] =
+		CalculateDensitiesAtPoint(Position).x;
+}
+
+[numthreads(4, 4, 4)]
+void BuildMarchingCubesSurface(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint3 CubesPerAxis = (uint3)(SurfaceGridSize - 1);
+	if (any(DispatchThreadID >= CubesPerAxis))
+	{
+		return;
+	}
+
+	uint CubeLinearIndex = DispatchThreadID.x
+		+ CubesPerAxis.x
+			* (DispatchThreadID.y + CubesPerAxis.y * DispatchThreadID.z);
+	uint BaseVertex = CubeLinearIndex * 15;
+	int3 Coordinate = (int3)DispatchThreadID;
+	float3 DegeneratePosition = SurfaceCoordinateToPosition(Coordinate);
+
+	for (uint EmptyVertex = 0; EmptyVertex < 15; ++EmptyVertex)
+	{
+		WriteSurfaceVertex(
+			BaseVertex + EmptyVertex,
+			DegeneratePosition,
+			float3(0.0, 0.0, 1.0));
+	}
+
+	int3 CornerCoordinates[8];
+	CornerCoordinates[0] = Coordinate + int3(0, 0, 0);
+	CornerCoordinates[1] = Coordinate + int3(1, 0, 0);
+	CornerCoordinates[2] = Coordinate + int3(1, 0, 1);
+	CornerCoordinates[3] = Coordinate + int3(0, 0, 1);
+	CornerCoordinates[4] = Coordinate + int3(0, 1, 0);
+	CornerCoordinates[5] = Coordinate + int3(1, 1, 0);
+	CornerCoordinates[6] = Coordinate + int3(1, 1, 1);
+	CornerCoordinates[7] = Coordinate + int3(0, 1, 1);
+
+	int CubeConfiguration = 0;
+	for (int CornerIndex = 0; CornerIndex < 8; ++CornerIndex)
+	{
+		if (SampleSurfaceDensity(CornerCoordinates[CornerIndex])
+			>= SurfaceIsoLevel)
+		{
+			CubeConfiguration |= 1 << CornerIndex;
+		}
+	}
+
+	int NumIndices = MarchingLengths[CubeConfiguration];
+	int LookupOffset = MarchingOffsets[CubeConfiguration];
+	for (int Index = 0; Index < NumIndices; ++Index)
+	{
+		int TriangleVertex = Index % 3;
+		int ReversedIndex = TriangleVertex == 0
+			? Index + 2
+			: (TriangleVertex == 2 ? Index - 2 : Index);
+		int Edge = MarchingCubesLUT[LookupOffset + ReversedIndex];
+		int CornerA = MarchingCornerAFromEdge[Edge];
+		int CornerB = MarchingCornerBFromEdge[Edge];
+		CreateSurfaceVertex(
+			BaseVertex + Index,
+			CornerCoordinates[CornerA],
+			CornerCoordinates[CornerB]);
+	}
+}
+
+static const float3 OctahedronDirections[6] =
+{
+	float3(0.0, 0.0, 1.0),
+	float3(0.0, 0.0, -1.0),
+	float3(1.0, 0.0, 0.0),
+	float3(0.0, 1.0, 0.0),
+	float3(-1.0, 0.0, 0.0),
+	float3(0.0, -1.0, 0.0)
+};
+
+[numthreads(ParticleThreadGroupSize, 1, 1)]
+void BuildParticleMesh(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	uint VertexIndex = DispatchThreadID.x;
+	uint ParticleIndex = VertexIndex / 6;
+	if (ParticleIndex >= NumParticles)
+	{
+		return;
+	}
+
+	uint LocalVertexIndex = VertexIndex - ParticleIndex * 6;
+	float3 Normal = OctahedronDirections[LocalVertexIndex];
+	float3 PositionCm =
+		Positions[ParticleIndex].xyz * SimulationToCentimeters
+		+ Normal * RenderRadiusCm;
+
+	OutputPositions[VertexIndex * 3 + 0] = PositionCm.x;
+	OutputPositions[VertexIndex * 3 + 1] = PositionCm.y;
+	OutputPositions[VertexIndex * 3 + 2] = PositionCm.z;
+
+	float3 Reference = abs(Normal.z) < 0.99
+		? float3(0.0, 0.0, 1.0)
+		: float3(0.0, 1.0, 0.0);
+	float3 Tangent = normalize(cross(Reference, Normal));
+	OutputTangents[VertexIndex * 2 + 0] = float4(Tangent, 1.0);
+	OutputTangents[VertexIndex * 2 + 1] = float4(Normal, 1.0);
+}

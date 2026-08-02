@@ -1,0 +1,29 @@
+# Unreal generated folders
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# IDE-generated files
+.vs/
+.vscode/
+*.VC.db
+*.VC.opendb
+*.opensdf
+*.sdf
+*.sln
+*.suo
+*.user
+*.xcodeproj
+*.xcworkspace
+Makefile
+
+# Build-system noise
+*.log
+*.tmp
+*.bak
+
+# Plugin build products, if plugins are added later
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
+
