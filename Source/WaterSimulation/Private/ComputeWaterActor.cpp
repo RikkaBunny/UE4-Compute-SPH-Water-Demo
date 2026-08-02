@@ -1,12 +1,12 @@
 #include "ComputeWaterActor.h"
 
-#include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
 #include "Components/InputComponent.h"
 #include "ComputeWaterComponent.h"
+#include "ComputeWaterFreeCameraPawn.h"
 #include "WaterSimulation.h"
 #include "Engine/LocalPlayer.h"
-#include "EngineUtils.h"
+#include "Camera/PlayerCameraManager.h"
 #include "GameFramework/PlayerController.h"
 #include "InputCoreTypes.h"
 #include "Math/RotationMatrix.h"
@@ -14,6 +14,7 @@
 
 AComputeWaterActor::AComputeWaterActor(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
+	, bEnableFreeCamera(true)
 	, bEnableMouseDrag(true)
 	, bRequireCursorOverContainer(false)
 	, DragResponsiveness(8.0f)
@@ -53,7 +54,12 @@ void AComputeWaterActor::BeginPlay()
 			SetupContainerInput(PlayerController);
 		}
 	}
-	if (WaterSurface == nullptr
+	if (bEnableFreeCamera)
+	{
+		SetupFreeCamera();
+	}
+	if (!bEnableFreeCamera
+		|| WaterSurface == nullptr
 		|| !WaterSurface->bUseSourceScreenSpace2Preset
 		|| !WaterSurface->bFrameSourceDemoOnPlay)
 	{
@@ -63,6 +69,67 @@ void AComputeWaterActor::BeginPlay()
 	GetWorldTimerManager().SetTimerForNextTick(
 		this,
 		&AComputeWaterActor::ApplySourceDemoCamera);
+}
+
+AComputeWaterFreeCameraPawn* AComputeWaterActor::SetupFreeCamera()
+{
+	APlayerController* PlayerController =
+		GetWorld() != nullptr
+			? GetWorld()->GetFirstPlayerController()
+			: nullptr;
+	if (PlayerController == nullptr)
+	{
+		return nullptr;
+	}
+
+	AComputeWaterFreeCameraPawn* FreeCamera =
+		Cast<AComputeWaterFreeCameraPawn>(PlayerController->GetPawn());
+	if (FreeCamera != nullptr)
+	{
+		return FreeCamera;
+	}
+
+	FVector InitialLocation = GetActorLocation();
+	FRotator InitialRotation = GetActorRotation();
+	float InitialFov = 90.0f;
+	if (PlayerController->PlayerCameraManager != nullptr)
+	{
+		InitialLocation =
+			PlayerController->PlayerCameraManager->GetCameraLocation();
+		InitialRotation =
+			PlayerController->PlayerCameraManager->GetCameraRotation();
+		InitialFov = PlayerController->PlayerCameraManager->GetFOVAngle();
+	}
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.SpawnCollisionHandlingOverride =
+		ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	FreeCamera = GetWorld()->SpawnActor<AComputeWaterFreeCameraPawn>(
+		AComputeWaterFreeCameraPawn::StaticClass(),
+		FTransform(InitialRotation, InitialLocation),
+		SpawnParameters);
+	if (FreeCamera == nullptr)
+	{
+		return nullptr;
+	}
+
+	PlayerController->Possess(FreeCamera);
+	PlayerController->SetControlRotation(InitialRotation);
+	PlayerController->SetViewTarget(FreeCamera);
+	if (FreeCamera->Camera != nullptr)
+	{
+		FreeCamera->Camera->SetFieldOfView(InitialFov);
+	}
+	if (ULocalPlayer* LocalPlayer = PlayerController->GetLocalPlayer())
+	{
+		LocalPlayer->AspectRatioAxisConstraint =
+			AspectRatio_MaintainYFOV;
+	}
+	UE_LOG(
+		LogWaterSimulation,
+		Log,
+		TEXT("Free camera ready: RMB look, WASD move, Q/E down/up, LMB drag"));
+	return FreeCamera;
 }
 
 void AComputeWaterActor::Tick(float DeltaSeconds)
@@ -228,6 +295,13 @@ bool AComputeWaterActor::IsPointInsideContainerFootprint(
 void AComputeWaterActor::BeginContainerDrag(
 	APlayerController* PlayerController)
 {
+	// A hidden cursor means the right mouse button currently owns input for
+	// free-camera look. Never start a container drag in that mode.
+	if (PlayerController == nullptr || !PlayerController->bShowMouseCursor)
+	{
+		return;
+	}
+
 	FVector WorldPoint;
 	if (!ProjectMouseToDragPlane(PlayerController, WorldPoint)
 		|| (bRequireCursorOverContainer
@@ -324,16 +398,7 @@ void AComputeWaterActor::ApplySourceDemoCamera()
 	{
 		return;
 	}
-	ACameraActor* SourceCamera = nullptr;
-	for (TActorIterator<ACameraActor> It(GetWorld()); It; ++It)
-	{
-		SourceCamera = *It;
-		break;
-	}
-	if (SourceCamera == nullptr)
-	{
-		SourceCamera = GetWorld()->SpawnActor<ACameraActor>();
-	}
+	AComputeWaterFreeCameraPawn* SourceCamera = SetupFreeCamera();
 	if (SourceCamera == nullptr)
 	{
 		return;
@@ -362,8 +427,8 @@ void AComputeWaterActor::ApplySourceDemoCamera()
 	SourceCamera->SetActorLocationAndRotation(
 		CameraPosition,
 		CameraRotation);
-	if (UCameraComponent* CameraComponent =
-		SourceCamera->GetCameraComponent())
+	PlayerController->SetControlRotation(CameraRotation);
+	if (UCameraComponent* CameraComponent = SourceCamera->Camera)
 	{
 		// Unity preserves a 60-degree vertical FOV for every viewport aspect.
 		// UE stores a horizontal FOV, so retain the 16:9 reference aspect and

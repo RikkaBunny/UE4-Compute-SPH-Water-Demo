@@ -60,6 +60,7 @@ float3 CameraForwardWorld;
 float2 CameraTanHalfFov;
 float3 CameraPositionWorld;
 float3 SimulationOriginWorld;
+float3 EnvironmentOriginWorld;
 float SourceShadowHalfWidthCm;
 float SourceShadowHalfHeightCm;
 uint FoamMax;
@@ -744,7 +745,7 @@ float3 SampleSourceEnvironment(
 	float3 WorldDirection)
 {
 	float3 LocalPosition =
-		WorldPosition - SimulationOriginWorld;
+		WorldPosition - EnvironmentOriginWorld;
 	float3 LocalDirection = WorldDirection;
 	float FloorDistance =
 		(2.5 - LocalPosition.z)
@@ -790,7 +791,14 @@ float3 SampleSourceEnvironment(
 			* float3(0.2, 0.0, 0.73)
 			* 0.1;
 		TileColour = TweakHSV(TileColour, RandomVariation);
-		float ShadowAmount = SampleSourceShadow(FloorPoint);
+		// The shadow texture is stored in the translating container frame,
+		// while FloorPoint is now relative to the fixed environment. Convert
+		// back into current container-local space before sampling it.
+		float3 ContainerFloorPoint =
+			FloorPoint
+			+ EnvironmentOriginWorld
+			- SimulationOriginWorld;
+		float ShadowAmount = SampleSourceShadow(ContainerFloorPoint);
 		float3 ShadowTransmission =
 			exp(
 				-ShadowAmount

@@ -165,6 +165,7 @@ class FSPHScreenCompositePS final : public FGlobalShader
 		SHADER_PARAMETER(FVector2D, CameraTanHalfFov)
 		SHADER_PARAMETER(FVector, CameraPositionWorld)
 		SHADER_PARAMETER(FVector, SimulationOriginWorld)
+		SHADER_PARAMETER(FVector, EnvironmentOriginWorld)
 		SHADER_PARAMETER(FIntPoint, ShadowSize)
 		SHADER_PARAMETER(float, SourceShadowHalfWidthCm)
 		SHADER_PARAMETER(float, SourceShadowHalfHeightCm)

@@ -460,6 +460,7 @@ public:
 		, SurfaceVertexFactory(
 			GetScene().GetFeatureLevel(),
 			"FComputeWaterSurfaceSceneProxy")
+		, EnvironmentOriginWorld(Component->GetComponentLocation())
 		, Material(InMaterial)
 		, MaterialRelevance(
 			InMaterial->GetRelevance_Concurrent(
@@ -1136,6 +1137,11 @@ public:
 			View.ViewMatrices.GetViewOrigin();
 		CompositeParameters->PixelParameters.SimulationOriginWorld =
 			ComponentLocalToWorld.GetOrigin();
+		// The source environment is independent from the movable simulation
+		// container. Keeping its original world origin provides a stationary
+		// visual reference while the tank and fluid translate.
+		CompositeParameters->PixelParameters.EnvironmentOriginWorld =
+			EnvironmentOriginWorld;
 		CompositeParameters->PixelParameters.ShadowSize =
 			ShadowExtent;
 		CompositeParameters->PixelParameters.SourceShadowHalfWidthCm =
@@ -2329,6 +2335,7 @@ private:
 	FRWBufferStructured ScanGroupSums[SPHFluid::MaxScanLevels];
 	int32 ScanLevelCount = 0;
 
+	const FVector EnvironmentOriginWorld;
 	UMaterialInterface* Material;
 	FMaterialRelevance MaterialRelevance;
 	bool bResourcesInitialized = false;
