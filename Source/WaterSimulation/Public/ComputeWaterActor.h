@@ -5,6 +5,7 @@
 
 class UComputeWaterComponent;
 class APlayerController;
+class AComputeWaterFreeCameraPawn;
 
 UCLASS(BlueprintType)
 class WATERSIMULATION_API AComputeWaterActor : public AActor
@@ -18,6 +19,10 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Compute Water")
 	UComputeWaterComponent* WaterSurface;
+
+	/** Use an editor-style fly camera instead of a fixed camera actor. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Compute Water|Camera")
+	bool bEnableFreeCamera;
 
 	/** Allow the source-demo container to be grabbed with the left mouse button. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Compute Water|Container Drag")
@@ -55,6 +60,7 @@ public:
 	bool bIsDraggingContainer;
 
 private:
+	AComputeWaterFreeCameraPawn* SetupFreeCamera();
 	void ApplySourceDemoCamera();
 	bool ProjectMouseToDragPlane(
 		APlayerController* PlayerController,

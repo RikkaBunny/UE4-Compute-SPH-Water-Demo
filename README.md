@@ -95,6 +95,15 @@ settings are exposed under `Compute Water | Container Drag`:
 - `Drag Max Speed Cm Per Second`
 - `Drag Acceleration Cm Per Second Squared`
 
+Camera and interaction controls:
+
+- Hold the right mouse button and move the mouse to look around.
+- Use `W`, `A`, `S`, and `D` to fly horizontally while looking.
+- Use `Q` and `E` to fly down and up.
+- Press and drag the left mouse button to move the simulation container.
+- Releasing the right mouse button restores the cursor at its previous position,
+  ready for container dragging.
+
 Container motion is not limited to the built-in mouse control. Moving the
 actor from Blueprint or C++ is detected by `ComputeWaterComponent` as well.
 The component converts the container's world velocity change into a local,
